@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .db import connect, transaction
+from .db import connect, resilient, transaction
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,7 @@ class LeaseLost(Exception):
     """This worker is no longer allowed to train the job."""
 
 
+@resilient
 def register_worker(path: Path | str, worker_id: str) -> None:
     now = time.time()
     with transaction(path) as conn:
@@ -47,6 +48,7 @@ def register_worker(path: Path | str, worker_id: str) -> None:
         )
 
 
+@resilient
 def heartbeat(path: Path | str, worker_id: str, status: str) -> None:
     with transaction(path) as conn:
         conn.execute(
@@ -68,6 +70,7 @@ def _allocate_epoch(conn: sqlite3.Connection, job_id: str) -> int:
     return int(row["epoch"])
 
 
+@resilient
 def acquire(
     path: Path | str, job_id: str, worker_id: str, lease_seconds: float
 ) -> Lease | None:
@@ -101,6 +104,7 @@ def acquire(
         return Lease(job_id, worker_id, epoch)
 
 
+@resilient
 def renew(path: Path | str, lease: Lease, lease_seconds: float) -> bool:
     """Renew if we still match the lease; ``False`` means it moved on."""
     now = time.time()
@@ -123,6 +127,7 @@ def owner_ok(conn: sqlite3.Connection, lease: Lease) -> bool:
     return bool(row) and row["worker_id"] == lease.worker_id and int(row["epoch"]) == lease.epoch
 
 
+@resilient
 def release(path: Path | str, lease: Lease) -> None:
     """Give up a lease, but only if it is still ours.
 

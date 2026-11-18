@@ -63,6 +63,29 @@ docker compose up -d --build
 4. 完成状态由 `step == total_steps` 在提交事务内一次性置位；旧工作器无法再写入。
 5. SQLite 使用 WAL + `synchronous=FULL`，已提交的断点在进程崩溃/容器重启后仍然存在。
 
+## 暂时写锁下的自恢复
+
+另一个连接长时间持有写事务时，SQLite 的写者会遇到 `SQLITE_BUSY`。平台对此分两层
+处理，保证**暂时写锁不会造成永久停训**：
+
+1. **单次操作层（`app/db.py` 的 `retry_on_busy`）**：每个写操作先按
+   `TRAINING_SQLITE_BUSY_TIMEOUT`（默认 30s）在 SQLite 内排队；仍拿不到锁就按
+   0.05s 起、上限 1s 的退避整体重试，总预算 `TRAINING_LOCK_RETRY_SECONDS`（默认
+   300s）。重试的是**整个工作单元**——忙错误意味着该事务没有提交，所以重放不会产生
+   重复批次；非锁错误立即抛出，绝不吞掉。
+2. **工作器主循环层（`app/worker.py`）**：即便总预算耗尽，工作器进程也不退出，而是
+   退避后带着原租约重新进入同一个任务，从数据库里**最新已确认断点**继续；锁恢复可写
+   后自行接单，无需重启。启动注册、空闲心跳同样跨过锁中断存活；等待期间收到
+   SIGTERM/SIGINT 会立即响应退出。
+3. **只报已确认的结果**：批次日志、完成判断都在 `advance_job` 事务成功提交之后才输出，
+   锁等待/超时期间不会误报"批次已提交"或"已完成"；锁内 WAL 读仍可用，进度查询返回的
+   始终是最后一个已提交断点。
+4. **接管围栏不变**：锁阻塞导致心跳过期时，另一个工作器在锁释放后接管并
+   `epoch + 1`；旧实例恢复后的提交仍被事务内 `(worker_id, epoch)` 围栏拒绝，不能写入
+   或回退断点。最终权重仍与不中断训练逐位一致。
+5. API 在锁预算耗尽时对 `POST /jobs` 返回 `503` + `Retry-After`（未写入任何数据，可
+   安全重试），读接口不受影响。
+
 ## 演示与验证
 
 ```bash
@@ -75,9 +98,17 @@ python3 scripts/demo.py --local
 # 不依赖 Docker 的三项自检
 python3 scripts/selftest.py
 
-# 单元/集成测试（含真实 uvicorn + 两个工作器进程、SIGKILL 接管、迟到工作器围栏）
+# 单元/集成测试（含真实 uvicorn + 两个工作器进程、SIGKILL 接管、迟到工作器围栏、
+# 长写锁超时与恢复）
 python3 -m pytest -q
 ```
+
+锁相关测试用独立连接/子进程持有 `BEGIN IMMEDIATE` 模拟长写事务：
+
+- `tests/test_lock_recovery.py`：线程级——重试退避、停止钩子、锁超时期间不提交、
+  释放后从已确认断点恢复并与不中断训练逐位一致、双工作器恢复时的租约围栏；
+- `tests/test_lock_integration.py`：进程级——真实 uvicorn + 两个工作器进程，
+  锁长于 busy timeout 与重试预算、双工作器同时恢复、API 在锁内返回可重试 503。
 
 演示脚本第 6 步会用同一份输入再训练一次（不中断），并断言两次的 `final_weights`、
 `loss`、`momentum_velocity` 完全相等。
@@ -92,7 +123,10 @@ python3 -m pytest -q
 | `TRAINING_HEARTBEAT_INTERVAL` | `1.0` | 心跳间隔（必须小于租约） |
 | `TRAINING_POLL_INTERVAL` | `0.3` | 空闲轮询/批间间隔 |
 | `TRAINING_BATCH_DELAY_SECONDS` | `0` | 模拟每批耗时，便于演示 |
-| `TRAINING_DEMO_PAUSE_FILE` | 未设置 | 演示用：文件存在时在批间暂停（不心跳） |
+| `TRAINING_SQLITE_BUSY_TIMEOUT` | `30` | 单次写操作等待写锁的 SQLite busy timeout（秒） |
+| `TRAINING_LOCK_RETRY_SECONDS` | `300` | 一个写操作遇到 `SQLITE_BUSY` 后的整体重试总预算（秒） |
+| `TRAINING_LOG_LEVEL` | `INFO` | 工作器日志级别 |
+| `TRAINING_DEMO_PAUSE_FILE` | 未设置 | 演示用：文件存在时在批间暂停（不心跳）；支持 `..._<WORKER_ID>` 后缀只暂停指定工作器 |
 | `TRAINING_DEMO_CRASH_AFTER` | 未设置 | 演示用：指定步数提交后 `os._exit` |
 
 ## 目录

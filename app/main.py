@@ -1,6 +1,7 @@
 """Training API service."""
 from __future__ import annotations
 
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -10,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from . import store
 from .config import Settings
-from .db import init_db, reader
+from .db import init_db, is_busy_error, reader
 from .features import InputError
 
 settings = Settings.from_env()
@@ -70,6 +71,16 @@ def submit_job(request: TrainingRequest) -> dict[str, Any]:
         )
     except InputError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except sqlite3.Error as exc:
+        # A temporary write lock survived the whole retry budget.  Nothing was
+        # inserted, so the client may safely retry the same request.
+        if is_busy_error(exc):
+            raise HTTPException(
+                status_code=503,
+                detail="database temporarily locked by another writer; retry shortly",
+                headers={"Retry-After": "2"},
+            ) from exc
+        raise
 
 
 @app.get("/jobs", tags=["training"])

@@ -23,7 +23,7 @@ from typing import Any
 
 import numpy as np
 
-from .db import reader, transaction
+from .db import reader, resilient, retry_on_busy, transaction
 from .features import (
     BATCH_SIZE,
     LEARNING_RATE,
@@ -85,44 +85,50 @@ def create_job(
 
     job_id = uuid.uuid4().hex
     now = time.time()
-    with transaction(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO jobs(
-                job_id, status, feature_dim, epochs, batch_size, record_count,
-                total_batches, learning_rate, momentum, features_json, labels_json,
-                weights_json, velocity_json, loss, completed_steps, created_at, updated_at
-            ) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-            """,
-            (
+
+    def _insert() -> None:
+        with transaction(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO jobs(
+                    job_id, status, feature_dim, epochs, batch_size, record_count,
+                    total_batches, learning_rate, momentum, features_json, labels_json,
+                    weights_json, velocity_json, loss, completed_steps, created_at, updated_at
+                ) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    job_id,
+                    feature_dim,
+                    epochs,
+                    BATCH_SIZE,
+                    int(design.shape[0]),
+                    per_epoch,
+                    LEARNING_RATE,
+                    MOMENTUM,
+                    json.dumps(design.tolist()),
+                    json.dumps([float(v) for v in targets], allow_nan=False),
+                    _dumps(weights),
+                    _dumps(velocity),
+                    initial_loss,
+                    now,
+                    now,
+                ),
+            )
+            _event(
+                conn,
                 job_id,
-                feature_dim,
-                epochs,
-                BATCH_SIZE,
-                int(design.shape[0]),
-                per_epoch,
-                LEARNING_RATE,
-                MOMENTUM,
-                json.dumps(design.tolist()),
-                json.dumps([float(v) for v in targets], allow_nan=False),
-                _dumps(weights),
-                _dumps(velocity),
-                initial_loss,
-                now,
-                now,
-            ),
-        )
-        _event(
-            conn,
-            job_id,
-            "job_created",
-            {
-                "records": int(design.shape[0]),
-                "epochs": epochs,
-                "batches_per_epoch": per_epoch,
-                "total_steps": total_steps,
-            },
-        )
+                "job_created",
+                {
+                    "records": int(design.shape[0]),
+                    "epochs": epochs,
+                    "batches_per_epoch": per_epoch,
+                    "total_steps": total_steps,
+                },
+            )
+
+    # The whole insert is one retryable unit: if the write lock was busy,
+    # nothing was inserted, so re-executing cannot create duplicate jobs.
+    retry_on_busy(_insert)
     job = get_job(db_path, job_id)
     assert job is not None
     return job
@@ -264,6 +270,7 @@ def claimable_jobs(db_path, limit: int = 20) -> list[str]:
     return [row["job_id"] for row in rows]
 
 
+@resilient
 def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, Any]:
     """Commit exactly one batch for ``lease``'s job.
 
@@ -382,6 +389,7 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
     }
 
 
+@resilient
 def record_event(db_path, job_id: str, event: str, detail: dict[str, Any] | None = None) -> None:
     with transaction(db_path) as conn:
         _event(conn, job_id, event, detail)

@@ -6,6 +6,10 @@ x-worker-env: &worker-env
   TRAINING_HEARTBEAT_INTERVAL: "1.5"
   TRAINING_POLL_INTERVAL: "0.3"
   TRAINING_BATCH_DELAY_SECONDS: "0.6"
+  # A write lock held longer than one 30 s busy-timeout window is retried for
+  # up to five minutes; workers stay alive and resume once the lock frees.
+  TRAINING_SQLITE_BUSY_TIMEOUT: "30"
+  TRAINING_LOCK_RETRY_SECONDS: "300"
 
 services:
   api:
@@ -24,6 +28,8 @@ services:
       TRAINING_DATA_DIR: /data
       TRAINING_LEASE_SECONDS: "6"
       TRAINING_HEARTBEAT_INTERVAL: "1.5"
+      TRAINING_SQLITE_BUSY_TIMEOUT: "30"
+      TRAINING_LOCK_RETRY_SECONDS: "300"
     volumes:
       - training-data:/data
     healthcheck:

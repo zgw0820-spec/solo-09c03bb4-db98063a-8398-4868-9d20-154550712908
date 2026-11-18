@@ -21,6 +21,11 @@ class Settings:
     API and both worker containers.  Jobs, checkpoints, leases and heartbeats
     live in it, so a checkpoint commit and the lease check that authorises it
     are a single atomic transaction.
+
+    A temporary write lock never stops training: each SQLite write waits up to
+    ``sqlite_busy_timeout`` seconds, then is retried with backoff for up to
+    ``lock_retry_seconds`` in total; the worker keeps the job and re-enters from
+    the newest committed checkpoint when an outage outlasts that budget.
     """
 
     db_path: Path
@@ -28,6 +33,8 @@ class Settings:
     heartbeat_interval: float
     poll_interval: float
     batch_delay_seconds: float
+    sqlite_busy_timeout: float = 30.0
+    lock_retry_seconds: float = 300.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -39,6 +46,8 @@ class Settings:
             heartbeat_interval=_float("TRAINING_HEARTBEAT_INTERVAL", 1.0),
             poll_interval=_float("TRAINING_POLL_INTERVAL", 0.3),
             batch_delay_seconds=_float("TRAINING_BATCH_DELAY_SECONDS", 0.0),
+            sqlite_busy_timeout=_float("TRAINING_SQLITE_BUSY_TIMEOUT", 30.0),
+            lock_retry_seconds=_float("TRAINING_LOCK_RETRY_SECONDS", 300.0),
         )
 
     def validate(self) -> None:
@@ -50,3 +59,7 @@ class Settings:
             raise ValueError("TRAINING_POLL_INTERVAL must be positive")
         if self.batch_delay_seconds < 0:
             raise ValueError("TRAINING_BATCH_DELAY_SECONDS must not be negative")
+        if self.sqlite_busy_timeout <= 0:
+            raise ValueError("TRAINING_SQLITE_BUSY_TIMEOUT must be positive")
+        if self.lock_retry_seconds < 0:
+            raise ValueError("TRAINING_LOCK_RETRY_SECONDS must not be negative")
